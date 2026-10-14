@@ -9,10 +9,16 @@
 Prefer to watch first? See the full review gate in a short walkthrough video: https://www.youtube.com/watch?v=-dGIUA_LLik
 
 Companion resources: the ebook [Governance Workflows for AI Agents](https://wandb.ai/site/resources/whitepapers/operationalizing-ai-governance/) and the webinar [How to Operationalize AI Governance for Production Agents](https://wandb.ai/site/resources/events/how-to-operationalize-ai-governance-for-production-agents/).
+
+Requires **Python 3.11 or newer**. Create a fresh virtual environment when
+upgrading from Python 3.10; existing environments keep their original interpreter.
+
 ```bash
 git clone https://github.com/wandb/rai-toolkit.git
 cd rai-toolkit
-pip install -e ".[all]"
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[all]"
 ```
 
 ```bash
@@ -135,7 +141,7 @@ Built-in coverage for:
 - **MIT AI Risk Repository** (24 categories, 7 domains)
 - **NIST AI RMF 1.0** (Govern / Map / Measure / Manage)
 - **EU AI Act** (Articles 9-15, high-risk requirements)
-- **Industry presets**: healthcare, financial services, government, general
+- **Industry presets**: healthcare, financial services, government, HR, general
 
 ### 3. Policy-as-code
 Encode your organization's compliance rules as versioned YAML files. Ship
@@ -164,7 +170,7 @@ into a claimed compliance breach.
 ```
 
 ### 4. Red-team adversarial suite
-32 curated attack templates covering jailbreaks, prompt injection, PII
+36 curated attack templates covering jailbreaks, prompt injection, PII
 extraction, bias probes, hallucination elicitation, goal hijacking, and
 refusal bypass. Optional third-party red-team tools live under
 `integrations/`, not the core `rai_toolkit.redteam` package.
@@ -172,8 +178,33 @@ refusal bypass. Optional third-party red-team tools live under
 ```python
 from rai_toolkit.redteam import AttackRunner
 report = await AttackRunner(my_model).run_all()
-print(f"Resistance rate: {report.overall_resistance_rate:.1%}")
+print(report.format_summary())
 ```
+
+Success and resistance rates use only attacks that produced an assessable
+outcome. Check `total_assessed`, `total_errors`, and `error_rate` when
+processing reports. Execution failures and indeterminate results from optional
+attack adapters are unassessed. If every attack is unassessed, both rates are
+`None` in Python and `null` in JSON, and reports show `n/a` rather than treating
+the missing evidence as resistance.
+Full assessments enforce a separate execution-error budget. Regulated presets
+default to 0%, while the general preset defaults to 10%. Pass
+`redteam_max_error_rate` to `Assessor` to set an explicit budget. A run in
+which every attack is unassessed always fails, regardless of the configured
+budget.
+An optional source named in `extra_redteam_sources` is part of the requested
+assessment scope. If that source is unavailable, fails before returning a
+report, or returns no attacks, the source-coverage gate fails. The failure is
+recorded separately and does not create a synthetic attack or change the
+attack error-rate denominator. Results from sources that did complete remain
+available, but incomplete source coverage contributes `0.0` red-team credit to
+the informational composite. Source setup diagnostics remain in the local
+assessment artifact. Hosted Weave views and W&B summaries retain the overall
+verdict without publishing those environment details.
+When red-team testing is disabled for a scope, or when no optional source was
+requested, non-applicable red-team gates are reported as `n/a`. Missing
+resistance contributes `0.0` to the informational composite instead of
+receiving default credit.
 
 ### 5. Reference examples catalog
 Standardized loaders for public RAI benchmarks:
@@ -261,49 +292,213 @@ through adapters.
 This project is **not published to PyPI**. Install it directly from the
 source tree (clone + editable install) or straight from GitHub.
 
+Use Python 3.11 or newer. The core test suite runs on Python 3.11, 3.12,
+3.13, and 3.14. The examples below use an activated virtual environment;
+replace `python3.11` with another installed supported interpreter if needed.
+For Windows environment setup, see [Contributing](CONTRIBUTING.md#setup).
+
+The `garak` and `all` extras require a platform supported by PyTorch and
+torchvision. On Python 3.11, their current dependency set resolves on Linux,
+Windows, and Apple Silicon macOS. Intel macOS lacks compatible torchvision wheels for
+the declared version range; use the core install or other extras there.
+
 ### Editable install from a clone (recommended for contributors)
 
 ```bash
 git clone https://github.com/wandb/rai-toolkit.git
 cd rai-toolkit
+python3.11 -m venv .venv
+source .venv/bin/activate
 
 # Core library only
-pip install -e .
+python -m pip install -e .
 
 # Weave tracing (recommended, lightweight, no ML deps)
-pip install -e ".[weave]"
+python -m pip install -e ".[weave]"
 
 # Weave tracing + LLM-judge scorers
-pip install -e ".[scorers]"
+python -m pip install -e ".[scorers]"
 
 # Public dataset loaders
-pip install -e ".[datasets]"
+python -m pip install -e ".[datasets]"
 
 # PyRIT red-team integration
-pip install -e ".[pyrit]"
+python -m pip install -e ".[pyrit]"
 
 # Garak red-team integration
-pip install -e ".[garak]"
+python -m pip install -e ".[garak]"
+
+# Anthropic Messages API model adapter
+python -m pip install -e ".[anthropic]"
 
 # Everything (incl. demo Streamlit app + dev tooling)
-pip install -e ".[all]"
+python -m pip install -e ".[all]"
 ```
+
+### Garak 0.17 smoke test
+
+The `garak` extra supports `garak>=0.17.0,<0.18`. Its four curated probes
+cover DAN, PromptInject, toxic continuation, and base64 encoding. CI runs
+the real probes on Linux with CPU-only PyTorch and Python 3.11 and 3.14.
+
+After installing the extra, this example runs one prompt per probe against
+a local function. It uses packaged probe data, requires no API keys, and
+does not download model weights:
+
+```python
+import asyncio
+import json
+
+from integrations.garak_integration import run_garak_probes
+from rai_toolkit.models.callable import CallableModel
+
+
+async def local_response(text, **kwargs):
+    return "I cannot help with that request."
+
+
+async def main():
+    model = CallableModel(local_response, name="garak-offline-smoke")
+    report = await run_garak_probes(model, prompt_cap=1)
+    assert report.total_assessed == 4, report.to_dict()
+    print(json.dumps(report.to_dict(), indent=2, allow_nan=False))
+
+
+asyncio.run(main())
+```
+
+The adapter uses the toolkit's refusal heuristic to summarize each probe's
+non-empty outputs. A non-refusal counts as a successful attack under this heuristic,
+even when the response is benign. These scores are not Garak detector scores
+and should not be compared with a native Garak scan. A probe with no usable
+output, or an execution failure, is unassessed with an error explanation.
+
+The adapter accepts single user turns containing text. It rejects history,
+system turns, and attachments. For the curated probes, `prompt_cap` limits
+model calls per probe and defaults to three; prompts and their associated
+metadata are capped together.
+Use the native Garak harness for detectors, translation, or broader workflows.
 
 ### Direct install from GitHub (for downstream users)
 
 ```bash
-pip install "git+https://github.com/wandb/rai-toolkit.git"
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install "git+https://github.com/wandb/rai-toolkit.git"
 
 # With extras
-pip install "rai-toolkit[weave,scorers] @ git+https://github.com/wandb/rai-toolkit.git"
-pip install "rai-toolkit[all] @ git+https://github.com/wandb/rai-toolkit.git"
+python -m pip install "rai-toolkit[weave,scorers] @ git+https://github.com/wandb/rai-toolkit.git"
+python -m pip install "rai-toolkit[all] @ git+https://github.com/wandb/rai-toolkit.git"
 ```
 
 You can pin to a specific commit, tag, or branch by appending `@<ref>` to the
-git URL (e.g. `git+https://github.com/wandb/rai-toolkit.git@v0.1.0`).
+git URL (e.g. `git+https://github.com/wandb/rai-toolkit.git@v0.3.0`).
 
 The Python import path is `rai_toolkit` (e.g. `from rai_toolkit import Assessor`)
 regardless of which install method you use.
+
+### Model adapters
+
+The toolkit ships vendor-neutral model adapters under `rai_toolkit.models`.
+They expose a shared `BaseModel` / `ModelResponse` contract, so you can swap
+providers without changing your assessment code.
+
+```bash
+# Anthropic Messages API adapter (optional extra)
+pip install -e ".[anthropic]"
+```
+
+```python
+import asyncio
+
+from rai_toolkit.models import AnthropicModel
+
+
+async def main() -> None:
+    model = AnthropicModel(
+        model="claude-sonnet-4-5",
+        # No api_key? The Anthropic SDK falls back to ANTHROPIC_API_KEY.
+        system_prompt="You are a triage assistant.",
+        max_tokens=1024,  # positive default; override per call below
+    )
+    result = await model.predict(
+        "Review this answer.",
+        context="Retrieved policy text",
+        max_tokens=2048,
+    )
+    print(result.output)
+    print(result.metadata)
+
+
+asyncio.run(main())
+```
+
+The optional key is never substituted: when `api_key` is omitted, key
+resolution is left entirely to the Anthropic SDK (e.g. the
+`ANTHROPIC_API_KEY` environment variable).
+
+Built-in adapters send `system_prompt` as trusted system instructions. When
+`context` is non-empty, they serialize it with `input_text` as lower-trust user
+data instead of promoting it to the system channel. This preserves the role
+boundary, but does not by itself prevent prompt injection.
+
+### Evaluating your own inference function
+
+`CallableModel` wraps any function you already have, so an in-process model,
+an internal SDK, or a proprietary endpoint can be assessed without writing a
+`BaseModel` subclass or adding a provider dependency.
+
+`CallableModel` passes `input_text`, `context`, and call-time options to your
+function unchanged. It does not build a provider request, choose message roles,
+or add the built-in adapters' context handling policy. Your function owns that
+boundary: keep retrieved context out of system instructions and other privileged
+channels, and pass it as separate, lower-trust data. Record how the function
+constructs its prompt before comparing injection-resistance results with a
+built-in adapter; wrapping a function does not establish equivalent prompt
+handling. See the [callable contract](docs/model_adapters.md#wrapping-a-callable).
+
+The examples below demonstrate return types and do not use `context`. For a RAG
+assessment, adapt the function to supply the retrieved context to its model.
+
+```python
+import asyncio
+
+from rai_toolkit.models import CallableModel, ModelResponse
+
+
+def my_model(input_text: str, context: str = "", **kwargs) -> str:
+    """Return a plain string and the adapter wraps it."""
+    return internal_sdk.complete(input_text)
+
+
+def my_model_with_metadata(input_text: str, context: str = "", **kwargs):
+    """Return a ModelResponse to carry your own metadata through unchanged."""
+    reply = internal_sdk.complete(input_text)
+    return ModelResponse(
+        output=reply.text,
+        metadata={"model": reply.model, "total_tokens": reply.usage.total},
+    )
+
+
+async def main() -> None:
+    model = CallableModel(my_model, name="internal-sdk-v2")
+    print((await model.predict("Review this answer.", context="Policy text")).output)
+
+    detailed = CallableModel(my_model_with_metadata)
+    print((await detailed.predict("Review this answer.")).metadata)
+
+
+asyncio.run(main())
+```
+
+Synchronous functions run on a worker thread so they do not block the event
+loop; `async def` functions are awaited directly. The callable is always
+invoked as `predict_fn(input_text, context=context, **kwargs)` and its
+signature is never inspected, so adapt a differently shaped function yourself:
+
+```python
+model = CallableModel(lambda text, context="", **kwargs: legacy_predict(text))
+```
 
 Running fully self-hosted or air-gapped? See [docs/self_hosted.md](docs/self_hosted.md).
 
@@ -371,9 +566,27 @@ a domain without forking scorer code.
 
 Available judge scorers include `FactualityJudge`, `FairnessJudge`,
 `ContentSafetyJudge`, `PrivacyJudge`, `SecurityJudge`, `TransparencyJudge`,
-`ExplainabilityJudge`, `RubricScorer`, and `GroundednessScorer`. The
+`ExplainabilityJudge`, `RubricScorer`, `GroundednessScorer`,
+`RetrievalRelevanceScorer`, `ContextPrecisionScorer`, and `ContextRecallScorer`. The
 `GroundednessScorer` evaluates RAG responses only when retrieved context is
 present and retains verified supporting or contradicting spans as evidence.
+The `RetrievalRelevanceScorer` grades retrieval quality itself: it validates
+the judge's per-chunk relevance verdicts against the parsed chunks, derives
+the overall score from them, and returns un-assessed rather than silently
+passing when the judge reply cannot be trusted. The `ContextPrecisionScorer`
+and `ContextRecallScorer` measure the retrieved set as a whole rather than
+chunk by chunk: precision reports the fraction of retrieved chunks the query
+actually needed, and recall reports how much of the row's reference answer the
+retrieval supplied. Both derive their score from validated verdicts, so a
+judge that cannot be trusted leaves the row un-assessed instead of scoring it.
+
+For custom scorers, see the [scorer-authoring guide](docs/scorer_authoring.md),
+including result semantics, verified evidence, retrieval-score denominators,
+and offline validation.
+
+To see an evaluation reproduce itself, with six synthetic responses scored offline
+by the shipped `RegexPIIScorer` and pinned fixtures, hashes and artifacts, see
+[docs/reproducible_evaluation.md](docs/reproducible_evaluation.md).
 
 ## Weave-native evaluation in assessment
 
@@ -410,6 +623,89 @@ ship in this repo).
 and `MultiTurnAgent` / `StreamingAgent` protocols so future harnesses can plug
 into the same compliance types without changing `BaseModel` today.
 
+`ToolCallAccuracyScorer` is an opt-in, offline scorer for complete structured
+invocation traces. Call it directly with recorded calls and explicit criteria:
+
+```python
+from rai_toolkit.scorers import ToolCallAccuracyScorer
+
+result = ToolCallAccuracyScorer().score(
+    output="The requested record was found.",
+    tool_calls=[
+        {"id": "call-1", "name": "lookup_record", "arguments": {"record_id": 42}}
+    ],
+    trace_complete=True,
+    success_criteria={
+        "tool_calls": {
+            "expected": [
+                {"name": "lookup_record", "arguments": {"record_id": 42}}
+            ],
+            "forbidden": ["send_email"],
+        }
+    },
+)
+assert result.assessed and result.passed
+```
+
+The current pipeline does not collect or forward invocation traces
+automatically. The scorer measures requested calls and exact arguments only;
+it does not establish successful execution or task completion. A runnable
+walkthrough of a pass, an argument mismatch, a forbidden call, and an
+incomplete trace is in
+[docs/tool_call_accuracy.md](docs/tool_call_accuracy.md).
+
+`TaskCompletionScorer` is the matching opt-in scorer for task outcomes. It
+compares a harness-recorded `final_state` against declared required values and
+forbidden flags, and ignores the response text:
+
+```python
+from rai_toolkit.scorers import TaskCompletionScorer
+
+scorer = TaskCompletionScorer()
+criteria = {
+    "task_completion": {
+        "required": {"order_status": "shipped", "refund_issued": False},
+        "forbidden": ["escalated_to_human"],
+    }
+}
+
+result = scorer.score(
+    output="Done!",
+    final_state={
+        "order_status": "shipped",
+        "refund_issued": False,
+        "escalated_to_human": False,
+    },
+    run_complete=True,
+    success_criteria=criteria,
+)
+assert result.assessed and result.passed
+
+# The forbidden flag was not recorded, so the evidence is incomplete.
+missing = scorer.score(
+    output="Done!",
+    final_state={"order_status": "shipped", "refund_issued": False},
+    run_complete=True,
+    success_criteria=criteria,
+)
+assert not missing.assessed
+assert missing.details["skipped"] == "incomplete_final_state"
+assert missing.details["missing_forbidden_keys"] == ["escalated_to_human"]
+```
+
+`run_complete=True` is the caller's attestation that the run ended and every
+declared outcome was collected. With that attestation, an absent **required**
+key is a known absent outcome and counts as a mismatch. A **forbidden** flag
+must be recorded as an explicit `True` or `False`; an absent flag leaves the
+row unassessed, and a non-boolean value is invalid. If a flag stands for an
+event at any point in the run, the harness must record the whole interval,
+since a final snapshot alone cannot show that no earlier forbidden event
+happened. The default threshold of `1.0` requires every required outcome; a
+lower threshold allows partial completion, but any forbidden flag set to
+`True` always fails. The scorer measures the supplied evidence only. It cannot
+authenticate the harness or prove that an external side effect took place,
+and the pipeline does not collect final state automatically.
+
 ## CLI
 
 ```bash
@@ -424,6 +720,9 @@ rai assess my_pkg:build_model --preset healthcare --dataset my-healthcare-eval -
 
 # Demo/smoke run with bundled examples
 rai assess my_pkg:build_model --preset healthcare --demo-datasets --output report.json
+
+# HR fairness/bias demo using answer-scored, split-balanced BBQ and BOLD slices
+rai assess my_pkg:build_model --preset hr --demo-datasets --output hr-report.json
 
 # List available reference datasets
 rai datasets list
@@ -452,13 +751,13 @@ rai_toolkit/
   monitoring/            Reassessment interval helpers (drift planning)
   guardrails/            Input/output guardrails, GuardedModel wrapper
   policies/              YAML policy engine + 13 starter policies
-  redteam/               32-attack catalog + AttackRunner
+  redteam/               36-attack catalog + AttackRunner
   prompts/               LLM-judge prompt templates (judge_prompts.py)
   examples/     Public benchmark loaders + curated JSON examples
   assessment/         End-to-end Assessor workflow + HTML report
   workflow/              Review gate: profile, scoping, submission,
                          decisions, ManualFinding from interactive probing
-  models/                BaseModel + OpenAI-compatible adapter
+  models/                BaseModel + OpenAI-compatible + Anthropic adapters
   cli.py                 `rai` command
 
 integrations/
@@ -480,7 +779,17 @@ PRs welcome. New here? Check the [good first issue](https://github.com/wandb/rai
 - Additional framework mappings (ISO 42001, Colorado AI Act, NYC LL144)
 - More red-team attack templates (with responsible disclosure)
 - Stronger LLM-judge coverage and prompts under `rai_toolkit/prompts`
-- Industry presets beyond healthcare / finance / government
+- Additional industry presets beyond the bundled healthcare / finance / government / HR set
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow and the
+[scorer-authoring guide](docs/scorer_authoring.md) for custom evaluation work.
+
+## Acknowledgments
+
+The toolkit includes community contributions to model adapters, scorers,
+industry presets, red-team templates, tests, and documentation. See
+[CONTRIBUTORS.md](CONTRIBUTORS.md) for contributor handles and links to merged
+work, and the [full contributor history](https://github.com/wandb/rai-toolkit/graphs/contributors).
 
 
 ## License
@@ -513,7 +822,8 @@ documents the licenses declared by each dependency in `pyproject.toml`.
 | [gql](https://github.com/graphql-python/gql) | 4.0.0 | MIT | `weave` |
 | [nemoguardrails](https://github.com/NVIDIA/NeMo-Guardrails) | 0.21.0 | Apache-2.0 | `nemo` |
 | [pyrit](https://github.com/microsoft/PyRIT) | 0.13.0 | MIT | `pyrit` |
-| [garak](https://github.com/NVIDIA/garak) | 0.15.0 | Apache-2.0 | `garak` |
+| [garak](https://github.com/NVIDIA/garak) | 0.17.0 (below 0.18) | Apache-2.0 | `garak` |
+| [anthropic](https://github.com/anthropics/anthropic-sdk-python) | 0.40.0 | MIT | `anthropic` |
 | [torchvision](https://github.com/pytorch/vision) | 0.20.0 | BSD-3-Clause | `garak` |
 | [streamlit](https://github.com/streamlit/streamlit) | 1.57.0 | Apache-2.0 | `demo` |
 | [plotly](https://github.com/plotly/plotly.py) | 6.0.0 | MIT | `demo` |

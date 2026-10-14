@@ -24,11 +24,18 @@ import logging
 import sys
 from pathlib import Path
 
+from rai_toolkit._version import __version__
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="rai",
         description="Responsible AI toolkit: compliance, evaluation, guardrails.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"rai {__version__}",
     )
     parser.add_argument(
         "--log-level",
@@ -107,7 +114,7 @@ def _build_datasets_parser(sub: argparse._SubParsersAction) -> None:
     )
     demo_p.add_argument(
         "--preset",
-        choices=["healthcare", "financial_services", "government", "general"],
+        choices=["healthcare", "financial_services", "government", "hr", "general"],
         default=None,
         help="Only show the demo dataset bundle for one preset.",
     )
@@ -272,6 +279,13 @@ def _cmd_policies_lint(args: argparse.Namespace) -> int:
         engine = PolicyEngine.from_directory(directory)
     except Exception as e:
         print(f"FAIL: {e}", file=sys.stderr)
+        return 1
+
+    if not engine.policy_sets:
+        print(
+            f"FAIL: no *.yaml policy files were found in {directory}",
+            file=sys.stderr,
+        )
         return 1
 
     total = len(engine.policies)

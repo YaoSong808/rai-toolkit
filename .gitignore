@@ -13,7 +13,18 @@
 !/.reuse/**
 !/pyproject.toml
 !/CONTRIBUTING.md
+!/CONTRIBUTORS.md
 !/CODE_OF_CONDUCT.md
+!/docs/
+!/docs/model_adapters.md
+!/docs/policy_packs.md
+!/docs/reproducible_evaluation.md
+!/docs/scorer_authoring.md
+!/docs/self_hosted.md
+!/docs/examples/
+!/docs/examples/**
+!/.github/
+!/.github/**
 
 # Toolkit source packages included by pyproject.toml.
 !/rai_toolkit/

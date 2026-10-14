@@ -84,14 +84,21 @@ view = AssessmentReportView.from_result(result)
 
 
 def _gate_chip(label: str, state: str, note: str = "") -> str:
-    color = "#0a5c2a" if state == "PASS" else "#8a1a1a"
-    bg = "#d4f4dd" if state == "PASS" else "#fce0e0"
+    color, bg = {
+        "PASS": ("#0a5c2a", "#d4f4dd"),
+        "FAIL": ("#8a1a1a", "#fce0e0"),
+        "N/A": ("#555", "#eee"),
+    }.get(state, ("#555", "#eee"))
     label_html = f"{label} ({note})" if note else label
     return (
         f'<span style="display:inline-block;padding:3px 10px;border-radius:12px;'
         f"font-weight:600;font-size:11px;background:{bg};color:{color};"
         f'margin-right:6px;">{label_html}: {state}</span>'
     )
+
+
+def _format_metric(percent: float | None) -> str:
+    return "n/a" if percent is None else f"{percent:.1%}"
 
 
 verdict_html = (
@@ -122,11 +129,31 @@ if view.rationale:
         )
 
 metric_cols = st.columns(4)
-metric_cols[0].metric(view.scores[0].label, f"{view.scores[0].percent:.1%}")
-metric_cols[1].metric(view.scores[1].label, f"{view.scores[1].percent:.1%}")
-metric_cols[2].metric(view.scores[2].label, f"{view.scores[2].percent:.1%}")
+metric_cols[0].metric(view.scores[0].label, _format_metric(view.scores[0].percent))
+metric_cols[1].metric(view.scores[1].label, _format_metric(view.scores[1].percent))
+metric_cols[2].metric(view.scores[2].label, _format_metric(view.scores[2].percent))
 metric_cols[3].metric("Policy violations", view.policy_violations_count)
 st.caption(view.disclaimer + " " + view.framework_coverage_footnote)
+
+if view.redteam_errors:
+    if view.redteam_attacks_assessed:
+        st.warning(
+            f"Red-team execution errors: {view.redteam_errors} of "
+            f"{view.redteam_attacks_total} attempted attacks. Rates use only the "
+            f"{view.redteam_attacks_assessed} assessed attacks."
+        )
+    else:
+        st.error(
+            f"No red-team attacks were assessed. All {view.redteam_attacks_total} "
+            "attempted attacks ended in execution errors."
+        )
+
+if view.redteam_source_failures:
+    failure_text = "; ".join(
+        f"{failure.source}: {failure.error}"
+        for failure in view.redteam_source_failures
+    )
+    st.error(f"Requested red-team source coverage is incomplete. {failure_text}")
 
 if view.weave_trace_url:
     st.markdown(f"**Weave trace:** [{view.weave_trace_url}]({view.weave_trace_url})")

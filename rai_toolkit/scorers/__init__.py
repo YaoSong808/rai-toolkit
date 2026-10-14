@@ -8,12 +8,15 @@ from rai_toolkit.scorers.base import BaseScorer, ScorerResult
 from rai_toolkit.scorers.composite import CompositeScorer
 from rai_toolkit.scorers.llm_judges import (
     ContentSafetyJudge,
+    ContextPrecisionScorer,
+    ContextRecallScorer,
     ExplainabilityJudge,
     FactualityJudge,
     FairnessJudge,
     GroundednessScorer,
     LLMJudgeScorer,
     PrivacyJudge,
+    RetrievalRelevanceScorer,
     RubricScorer,
     SecurityJudge,
     TransparencyJudge,
@@ -25,11 +28,15 @@ from rai_toolkit.scorers.programmatic import (
     RegexPIIScorer,
     ResponseLengthScorer,
 )
+from rai_toolkit.scorers.task_completion import TaskCompletionScorer
+from rai_toolkit.scorers.tool_calls import ToolCallAccuracyScorer
 
 __all__ = [
     "BaseScorer",
     "CompositeScorer",
     "ContentSafetyJudge",
+    "ContextPrecisionScorer",
+    "ContextRecallScorer",
     "ExplainabilityJudge",
     "FactualityJudge",
     "FairnessJudge",
@@ -40,9 +47,12 @@ __all__ = [
     "PrivacyJudge",
     "RegexPIIScorer",
     "ResponseLengthScorer",
+    "RetrievalRelevanceScorer",
     "RubricScorer",
     "ScoreNormalizer",
     "ScorerResult",
     "SecurityJudge",
+    "TaskCompletionScorer",
+    "ToolCallAccuracyScorer",
     "TransparencyJudge",
 ]

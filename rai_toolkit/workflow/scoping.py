@@ -21,6 +21,7 @@ from pathlib import Path
 from rai_toolkit.assessment import Assessor
 from rai_toolkit.examples import DEMO_EXAMPLE_BUNDLES
 from rai_toolkit.models.base import BaseModel
+from rai_toolkit.policies.engine import PolicyEngine, load_policy_set
 from rai_toolkit.workflow.profile import (
     ApplicationProfile,
     DeploymentContext,
@@ -48,6 +49,7 @@ class ScopingDecision:
     weave_entity: str | None
     effective_risk_tier: RiskTier
     rationale: list[str] = field(default_factory=list)
+    redteam_max_error_rate: float | None = None
 
     def as_markdown(self) -> str:
         lines = [
@@ -57,6 +59,7 @@ class ScopingDecision:
             f"- Datasets: `{', '.join(self.datasets) if self.datasets else '-'}`",
             f"- Red-team: {'on' if self.run_redteam else 'off'} "
             f"(max severity {self.redteam_max_severity})",
+            _error_budget_markdown(self),
             f"- Dataset row cap: {self.dataset_limit if self.dataset_limit else '-'}",
             f"- Effective risk tier: {self.effective_risk_tier.value}",
         ]
@@ -68,6 +71,14 @@ class ScopingDecision:
         for r in self.rationale:
             lines.append(f"- {r}")
         return "\n".join(lines)
+
+
+def _error_budget_markdown(decision: ScopingDecision) -> str:
+    if not decision.run_redteam:
+        return "- Red-team execution-error budget: N/A (red-team off)"
+    if decision.redteam_max_error_rate is None:
+        return "- Red-team execution-error budget: N/A (not recorded)"
+    return f"- Red-team execution-error budget: {decision.redteam_max_error_rate:.1%}"
 
 
 _SAMPLE_DATA_TYPE_EXTRA_DATASETS: dict[str, list[str]] = {
@@ -91,12 +102,63 @@ _DATASET_LIMIT: dict[RiskTier, int | None] = {
     RiskTier.CRITICAL: None,  # full dataset
 }
 
+# These policies apply to every built-in industry preset. Domain-specific
+# additions stay explicit here until first-class policy-pack loading lands.
+_COMMON_BUILTIN_POLICY_FILENAMES = (
+    "eu_ai_act_article_15.yaml",
+    "fairness_baseline.yaml",
+)
+_HEALTHCARE_POLICY_FILENAMES = ("healthcare_hipaa.yaml",)
+
 
 def _resolve_policies_dir(policies_dir: str | Path | None) -> str | None:
     if policies_dir is not None:
         return str(policies_dir)
-    default = Path(__file__).resolve().parents[1] / "policies" / "examples"
-    return str(default) if default.exists() else None
+    return str(_builtin_policy_directory())
+
+
+def _builtin_policy_directory() -> Path:
+    """Return the packaged directory containing built-in policy files."""
+    return Path(__file__).resolve().parents[1] / "policies" / "examples"
+
+
+def _builtin_policy_files(industry: Industry) -> list[Path]:
+    """Return the built-in policy files selected for one industry preset.
+
+    Built-ins are fail-closed: a missing directory, an unclassified YAML file,
+    or a duplicate selection is a packaging/registry error rather than a reason
+    to silently run a reduced policy set.
+    """
+    directory = _builtin_policy_directory()
+    if not directory.is_dir():
+        raise FileNotFoundError(
+            f"Built-in policy directory is missing: {directory}. "
+            "Pass policies_dir explicitly to use a user-supplied policy directory."
+        )
+
+    filenames = list(_COMMON_BUILTIN_POLICY_FILENAMES)
+    if industry is Industry.HEALTHCARE:
+        filenames.extend(_HEALTHCARE_POLICY_FILENAMES)
+
+    if len(filenames) != len(set(filenames)):
+        raise ValueError("Built-in policy registry selects a filename more than once.")
+
+    classified = set(_COMMON_BUILTIN_POLICY_FILENAMES) | set(
+        _HEALTHCARE_POLICY_FILENAMES
+    )
+    available = {path.name for path in directory.glob("*.yaml")}
+    unclassified = sorted(available - classified)
+    if unclassified:
+        raise ValueError(
+            "Built-in policy registry does not classify: " + ", ".join(unclassified)
+        )
+
+    missing = sorted(classified - available)
+    if missing:
+        raise FileNotFoundError(
+            "Built-in policy registry references missing file(s): " + ", ".join(missing)
+        )
+    return [directory / filename for filename in filenames]
 
 
 def _effective_risk_tier(
@@ -185,6 +247,12 @@ def scope_assessor(
         f"(risk tier = {effective_tier.value})."
     )
 
+    strict_error_budget = (
+        profile.industry is not Industry.GENERAL
+        or effective_tier in (RiskTier.HIGH, RiskTier.CRITICAL)
+    )
+    redteam_max_error_rate = 0.0 if strict_error_budget else 0.10
+
     # Public-facing deployments include adversarial users by default; bump
     # the severity cap one rung (clamped at 5) so we cover at least the
     # next attack tier the in-tree catalog defines. ``external`` (known
@@ -208,6 +276,15 @@ def scope_assessor(
             "Red-team skipped: internal deployment + low risk tier. "
             "Re-enable manually for belt-and-suspenders coverage."
         )
+    if run_redteam:
+        rationale.append(
+            f"Red-team execution-error budget = {redteam_max_error_rate:.1%} "
+            f"(industry = {profile.industry.value}, risk tier = {effective_tier.value})."
+        )
+    else:
+        rationale.append(
+            "Red-team execution-error budget not applied because red-team is off."
+        )
 
     dataset_limit = _DATASET_LIMIT[effective_tier]
     rationale.append(
@@ -216,8 +293,22 @@ def scope_assessor(
     )
 
     resolved_policies = _resolve_policies_dir(policies_dir)
-    if resolved_policies:
-        rationale.append(f"Policies loaded from `{resolved_policies}`.")
+    policies_engine: PolicyEngine | None = None
+    if policies_dir is not None:
+        # A caller-selected directory is a complete override: its files are
+        # loaded exactly as supplied, without mixing in or filtering built-ins.
+        if resolved_policies:
+            rationale.append(
+                f"Policies loaded from user-supplied `{resolved_policies}`."
+            )
+    else:
+        policy_files = _builtin_policy_files(profile.industry)
+        policies_engine = PolicyEngine([load_policy_set(path) for path in policy_files])
+        rationale.append(
+            "Built-in policy files selected: "
+            + ", ".join(f"`{path.name}`" for path in policy_files)
+            + "."
+        )
 
     if profile.weave_project:
         rationale.append(
@@ -230,9 +321,11 @@ def scope_assessor(
         model=model,
         preset=preset,
         datasets=datasets,
-        policies_dir=resolved_policies,
+        policies_dir=resolved_policies if policies_dir is not None else None,
+        policies_engine=policies_engine,
         run_redteam=run_redteam,
         redteam_max_severity=severity_cap,
+        redteam_max_error_rate=redteam_max_error_rate,
         extra_redteam_sources=list(profile.extra_redteam_sources),
         dataset_limit=dataset_limit,
         weave_project=profile.weave_project,
@@ -249,6 +342,7 @@ def scope_assessor(
         weave_project=profile.weave_project,
         weave_entity=profile.weave_entity,
         effective_risk_tier=effective_tier,
+        redteam_max_error_rate=redteam_max_error_rate,
         rationale=rationale,
     )
     return assessor, decision

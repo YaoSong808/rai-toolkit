@@ -201,7 +201,8 @@ class ComplianceMappingEngine:
         """Create a profile from an industry preset.
 
         Args:
-            industry: Industry name (healthcare, financial_services, government, general).
+            industry: Industry name (healthcare, financial_services, government,
+                hr, general).
             name: Optional profile name. Defaults to "{Industry} RAI Assessment".
             framework: Compliance framework. Defaults to MIT AI Risk Repository.
 

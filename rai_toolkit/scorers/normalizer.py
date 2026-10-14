@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import math
+
 from rai_toolkit.scorers.base import ScorerResult
 
 
@@ -33,6 +35,10 @@ class ScoreNormalizer:
         Returns:
             Normalized score between 0.0 and 1.0.
         """
+        if not math.isfinite(raw_score):
+            raise ValueError(f"raw_score must be finite, got {raw_score}")
+        if not math.isfinite(max_value):
+            raise ValueError(f"max_value must be finite, got {max_value}")
         if max_value <= 0:
             raise ValueError(f"max_value must be positive, got {max_value}")
         normalized = max(0.0, min(1.0, raw_score / max_value))

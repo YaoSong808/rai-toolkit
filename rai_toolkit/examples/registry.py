@@ -131,7 +131,10 @@ class ExampleRegistry:
             and ``category``.
         """
         desc = ExampleRegistry.get(slug)
-        n = limit if limit is not None else desc.default_limit
+        n = _validate_limit(limit if limit is not None else desc.default_limit)
+
+        if n == 0:
+            return []
 
         if desc.loader is not None:
             rows = desc.loader(n)
@@ -154,10 +157,10 @@ def _normalize_row(row: dict[str, Any], default_category: str) -> dict[str, Any]
     assessable for a row.
     """
     out: dict[str, Any] = {
-        "input_text": str(row.get("input_text") or row.get("question") or row.get("prompt") or ""),
-        "context": str(row.get("context") or row.get("passage") or ""),
-        "expected": str(row.get("expected") or row.get("answer") or row.get("label") or ""),
-        "category": str(row.get("category") or default_category),
+        "input_text": str(_first_present(row, "input_text", "question", "prompt", default="")),
+        "context": str(_first_present(row, "context", "passage", default="")),
+        "expected": str(_first_present(row, "expected", "answer", "label", default="")),
+        "category": str(_first_present(row, "category", default=default_category)),
     }
     rubrics = row.get("rubrics")
     if rubrics:
@@ -165,6 +168,22 @@ def _normalize_row(row: dict[str, Any], default_category: str) -> dict[str, Any]
     if "policy_expectations" in row:
         out["policy_expectations"] = row.get("policy_expectations")
     return out
+
+
+def _first_present(row: dict[str, Any], *keys: str, default: Any) -> Any:
+    """Return the first non-empty alias value without dropping valid falsy data."""
+    for key in keys:
+        value = row.get(key)
+        if value is not None and value != "":
+            return value
+    return default
+
+
+def _validate_limit(limit: Any) -> int:
+    """Validate a dataset row limit before dispatching to any loader."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+        raise ValueError("limit must be a non-negative integer")
+    return limit
 
 
 def _load_example_file(filename: str, limit: int) -> list[dict[str, Any]]:
@@ -274,8 +293,39 @@ def _truthfulqa_generation_loader(limit: int) -> list[dict[str, Any]]:
     return rows
 
 
+def _normalize_bbq_row(row: dict[str, Any]) -> dict[str, Any] | None:
+    choices = [str(choice).strip() for choice in row.get("choices") or []]
+    try:
+        answer_idx = int(row.get("answer"))
+    except (TypeError, ValueError):
+        answer_idx = -1
+    expected = choices[answer_idx] if 0 <= answer_idx < len(choices) else ""
+    context = str(row.get("context") or "").strip()
+    question = str(row.get("question") or "").strip()
+    if not question or not choices or not expected:
+        return None
+
+    choice_lines = "\n".join(f"{i}. {choice}" for i, choice in enumerate(choices))
+    return {
+        "input_text": (
+            f"{context}\n\nQuestion: {question}\n\nChoices:\n{choice_lines}"
+        ).strip(),
+        # The source context is already included in ``input_text``. Leaving the
+        # scorer context empty prevents FactualityJudge from treating an
+        # intentionally ambiguous answer such as "Unknown" as ungrounded.
+        "context": "",
+        "expected": expected,
+        "category": "MIT-1.1",
+        "rubrics": [{
+            "criterion": f'The response selects "{expected}" as the correct answer.',
+            "points": 1,
+            "tags": ["bbq", "answer_accuracy"],
+        }],
+    }
+
+
 def _bbq_loader(limit: int) -> list[dict[str, Any]]:
-    """Load BBQ from an accessible parquet-backed mirror.
+    """Load a round-robin sample from BBQ's demographic splits.
 
     ``heegyu/bbq`` now requires deprecated dataset scripts. ``walledai/BBQ``
     exposes one split per social dimension with a simple multiple-choice
@@ -283,32 +333,30 @@ def _bbq_loader(limit: int) -> list[dict[str, Any]]:
     """
     load_dataset = _require_datasets()
     rows: list[dict[str, Any]] = []
-    for split in _BBQ_SPLITS:
-        ds = load_dataset("walledai/BBQ", split=split, streaming=True)
-        for row in ds:
-            choices = [str(c).strip() for c in row.get("choices") or []]
-            try:
-                answer_idx = int(row.get("answer"))
-            except (TypeError, ValueError):
-                answer_idx = -1
-            expected = choices[answer_idx] if 0 <= answer_idx < len(choices) else ""
-            context = str(row.get("context") or "").strip()
-            question = str(row.get("question") or "").strip()
-            if not question or not choices:
+    if limit <= 0:
+        return rows
+
+    active_streams = [
+        iter(load_dataset("walledai/BBQ", split=split, streaming=True))
+        for split in _BBQ_SPLITS
+    ]
+    while active_streams and len(rows) < limit:
+        next_streams = []
+        for stream in active_streams:
+            normalized_row = None
+            for raw_row in stream:
+                normalized_row = _normalize_bbq_row(raw_row)
+                if normalized_row is not None:
+                    break
+
+            if normalized_row is None:
                 continue
-            choice_lines = "\n".join(
-                f"{i}. {choice}" for i, choice in enumerate(choices)
-            )
-            rows.append({
-                "input_text": (
-                    f"{context}\n\nQuestion: {question}\n\nChoices:\n{choice_lines}"
-                ).strip(),
-                "context": context,
-                "expected": expected,
-                "category": "MIT-1.1",
-            })
+            rows.append(normalized_row)
+            next_streams.append(stream)
             if len(rows) >= limit:
                 return rows
+
+        active_streams = next_streams
     return rows
 
 
@@ -603,7 +651,10 @@ EXAMPLE_CATALOG: dict[str, ExampleDescriptor] = {
     "bbq": ExampleDescriptor(
         slug="bbq",
         name="BBQ (Bias Benchmark for QA)",
-        description="Measures social bias in QA systems across 9 demographic axes.",
+        description=(
+            "Measures social bias in QA systems across demographic axes using "
+            "round-robin split sampling and answer-aware rubrics."
+        ),
         risk_category="MIT-1.1",
         license="CC-BY-4.0",
         reference="https://arxiv.org/abs/2110.08193",
@@ -757,6 +808,6 @@ DEMO_EXAMPLE_BUNDLES: dict[str, list[str]] = {
     ],
     "financial_services": ["finqa-sample"],
     "government": ["mit-risk-smoke"],
+    "hr": ["bbq", "bold"],
     "general": ["mit-risk-smoke"],
 }
-

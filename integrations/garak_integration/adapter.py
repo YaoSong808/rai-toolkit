@@ -8,28 +8,11 @@ Bridges ``NVIDIA/garak`` probes into the toolkit's :class:`RedTeamReport`
 schema so they merge cleanly with the in-tree catalog and PyRIT runs.
 The adapter shape mirrors :mod:`integrations.pyrit_integration.adapter`.
 
-Garak is heavyweight (its own probe registry, harness, generator
-abstraction, transient config object) so the adapter is intentionally
-narrow:
-
-* :class:`RAIGenerator`: wraps a toolkit :class:`BaseModel`.
-  Garak probes call ``generator.generate(prompt)`` synchronously, so the
-  generator captures the parent event loop at construction time and uses
-  :func:`asyncio.run_coroutine_threadsafe` to dispatch ``model.predict``
-  back onto that loop. This is what makes ``rai.model.predict`` spans
-  nest under each ``rai.redteam.garak.attack`` span in Weave. Without
-  it, the threaded ``asyncio.run`` boundary loses the parent call
-  context and the model calls show up as orphans.
-
-* :class:`GarakProbeSpec`: a recipe naming a probe + the toolkit-side
-  category/severity it maps to.
-
-* :func:`run_garak_probes`: execute a list of probes and return a
-  :class:`RedTeamReport`. Probes are configured with the few attributes
-  Garak normally pulls from its harness-time config
-  (``parallel_attempts``, ``generations``, ``_config.transient.reportfile``);
-  without that bootstrap, ``probe.probe()`` raises before it ever calls
-  the generator.
+The adapter supports Garak 0.17's single-turn text probes. Synchronous probe
+execution runs in a worker thread; ``asyncio.to_thread`` copies tracing
+context into that thread and ``asyncio.run`` preserves it for model calls.
+Outcomes use the toolkit's refusal heuristic, not Garak's native detectors.
+A scoped report sink supplies the harness state required by upstream probes.
 
 Garak isn't installed in slim installs; ``GARAK_INSTALLED`` is the gate.
 """
@@ -37,11 +20,14 @@ Garak isn't installed in slim installs; ``GARAK_INSTALLED`` is the gate.
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
+import os
 import re
 import time
+from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any
 
 from rai_toolkit import _tracing
@@ -55,6 +41,7 @@ logger = logging.getLogger(__name__)
 try:
     import garak  # noqa: F401
     from garak import _config as _garak_config
+    from garak.attempt import Conversation, Message
     from garak.generators.base import Generator as _GarakGenerator
 
     GARAK_INSTALLED = True
@@ -77,41 +64,53 @@ _REFUSAL_REGEXES = [re.compile(p, re.IGNORECASE) for p in _DEFAULT_REFUSAL_SIGNA
 def _require_garak() -> None:
     if not GARAK_INSTALLED:
         raise RuntimeError(
-            "garak is not installed. Install with `pip install \"rai-toolkit[garak]\"` "
-            "or `pip install garak` directly. Adapter targets NVIDIA/garak (formerly "
-            "leondz/garak)."
+            'garak is not installed. From a repository clone, run `pip install -e ".[garak]"` '
+            "to install the supported Garak 0.17 integration."
         )
 
 
-def _ensure_garak_transient_state() -> None:
-    """Set the transient config attrs Garak's harness usually sets.
+_report_lock = Lock()
+_report_users = 0
+_report_sink = None
 
-    Probes call ``_config.transient.reportfile.write(...)`` after each
-    attempt to log raw JSON. When we instantiate probes outside Garak's
-    CLI/harness, that attribute is ``None`` and the probe crashes after
-    the first model call. Stub it with an in-memory buffer so the probe
-    body runs through to completion.
+
+@contextmanager
+def _garak_report_sink():
+    """Supply a temporary sink until the last overlapping worker finishes.
+
+    Preserve a report stream owned by a native Garak harness. When there is
+    none, discard upstream JSON lines: the toolkit returns its own report.
+    The scope lives in the worker so cancellation cannot close an active sink.
     """
-    if _garak_config is None:
+    global _report_users, _report_sink
+    if _garak_config is None:  # Allows focused tests without the optional SDK.
+        yield
         return
-    transient = getattr(_garak_config, "transient", None)
-    if transient is None:
-        return
-    if getattr(transient, "reportfile", None) is None:
-        transient.reportfile = io.StringIO()
+    transient = _garak_config.transient
+    with _report_lock:
+        if _report_users == 0 and transient.reportfile is None:
+            _report_sink = open(os.devnull, "w", encoding="utf-8")
+            transient.reportfile = _report_sink
+        _report_users += 1
+    try:
+        yield
+    finally:
+        with _report_lock:
+            _report_users -= 1
+            if _report_users == 0 and _report_sink is not None:
+                if transient.reportfile is _report_sink:
+                    transient.reportfile = None
+                _report_sink.close()
+                _report_sink = None
 
 
 class RAIGenerator(_GarakGenerator):  # type: ignore[misc, valid-type]
-    """Garak ``Generator`` backed by an rai_toolkit :class:`BaseModel`.
+    """Garak 0.17 generator backed by a toolkit model's single-turn text API.
 
-    Garak probes are synchronous and call ``generator.generate(prompt)``.
-    The model is async. To keep ``rai.model.predict`` nested under the
-    parent ``rai.redteam.garak.attack`` span, the generator dispatches the
-    coroutine back onto the main event loop with
-    :func:`asyncio.run_coroutine_threadsafe`. That preserves Weave's
-    contextvar chain (which a fresh ``asyncio.run`` in a worker thread
-    would otherwise lose), so the model call shows up as a child span
-    with cost / duration like the PyRIT case.
+    Inherit Garak's generation-count validation, output checks, and hooks.
+    Model calls run on a worker event loop with the parent tracing context.
+    History, system turns, and attachments cannot be represented by this
+    adapter and are rejected instead of being silently discarded.
     """
 
     name = "rai_toolkit"
@@ -122,42 +121,40 @@ class RAIGenerator(_GarakGenerator):  # type: ignore[misc, valid-type]
     def __init__(self, model: BaseModel) -> None:
         _require_garak()
         super().__init__(name=getattr(model, "name", "rai_toolkit"))
+        # Upstream's multiple-generation path otherwise uses multiprocessing,
+        # which cannot carry the model's tracing context or live clients.
+        self.parallel_requests = 1
         self._model = model
 
-    def _call_model(self, prompt_text: str) -> str:
-        # The probe runs inside ``asyncio.to_thread`` so this method
-        # executes on a worker thread that inherited the parent
-        # ``rai.redteam.garak.attack`` call via contextvars. Spinning up
-        # a fresh event loop here with ``asyncio.run`` preserves those
-        # contextvars on the new Task. That's what makes
-        # ``model.predict`` nest under the attack span in Weave.
-        # Hopping back to the main loop via ``run_coroutine_threadsafe``
-        # would NOT preserve them: the Task gets created on the
-        # destination loop's thread, where the parent isn't set.
-        response = asyncio.run(self._model.predict(input_text=prompt_text))
-        return getattr(response, "output", "") or ""
-
-    def generate(  # type: ignore[override]
+    def _call_model(
         self,
-        prompt: Any,
+        prompt: Conversation,
         generations_this_call: int = 1,
-        **kwargs: Any,
-    ) -> list[str]:
-        # Garak hands us a ``Message`` or ``Conversation`` in recent
-        # versions, or a plain ``str`` in older ones. Coerce to text.
-        if hasattr(prompt, "text"):
-            prompt_text = prompt.text  # garak.attempt.Message
-        elif hasattr(prompt, "turns") and prompt.turns:
-            last = prompt.turns[-1]
-            inner = getattr(last, "content", last)
-            prompt_text = getattr(inner, "text", str(inner))
-        else:
-            prompt_text = str(prompt)
-
-        outputs: list[str] = []
-        for _ in range(max(1, generations_this_call)):
-            outputs.append(self._call_model(prompt_text))
-        return outputs
+    ) -> list[Message | None]:
+        if generations_this_call != 1:
+            raise ValueError("RAIGenerator makes one model call per generation.")
+        if len(prompt.turns) != 1 or prompt.turns[0].role != "user":
+            raise ValueError(
+                "RAIGenerator requires a single user turn without history."
+            )
+        message = prompt.turns[0].content
+        if not isinstance(message.text, str) or any(
+            value is not None
+            for value in (
+                message.data_path,
+                message.data_type,
+                message.data_checksum,
+                getattr(message, "_data", None),
+            )
+        ):
+            raise ValueError("RAIGenerator supports text only, without attachments.")
+        response = asyncio.run(self._model.predict(input_text=message.text))
+        output = getattr(response, "output", None)
+        if output is None:
+            return [None]
+        if not isinstance(output, str):
+            raise TypeError("The toolkit model must return text or no output.")
+        return [Message(text=output)]
 
 
 @dataclass
@@ -226,49 +223,56 @@ def _instantiate_probe(probe_path: str, prompt_cap: int) -> Any:
         raise ValueError(f"Invalid probe path: {probe_path!r}")
     module = __import__(module_path, fromlist=[class_name])
     cls = getattr(module, class_name)
-    probe = cls()
+    # Disable upstream sampling before construction. PromptInject shuffles
+    # prompts separately from pi_prompts; slice aligned records ourselves.
+    # Copy tags because EncodingMixin extends that list during construction.
+    config = {
+        "probes": {
+            module_path.rsplit(".", 1)[-1]: {
+                class_name: {
+                    "soft_probe_prompt_cap": 0,
+                    "follow_prompt_cap": False,
+                    "tags": deepcopy(getattr(cls, "tags", [])),
+                }
+            }
+        }
+    }
+    probe = cls(config_root=config)
 
     # System params Garak normally pulls from _config.system.*.
     probe.parallel_attempts = 1
     probe.generations = 1
     probe.soft_probe_prompt_cap = prompt_cap
 
-    # Cap the prompt list directly so probes with hardcoded prompt sets
-    # (HijackHateHumans, encoding, continuation) also stay short. The
-    # attribute is documented as part of every Probe's public API.
-    # Some probes (encoding) ship ``prompts`` as a tuple, coerce to list
-    # so the slice works regardless of the underlying container type.
-    prompts = getattr(probe, "prompts", None)
-    if isinstance(prompts, (list, tuple)) and len(prompts) > prompt_cap:
-        probe.prompts = list(prompts[:prompt_cap])
-    # Some probes also expose parallel ``triggers`` (one per prompt, used
-    # by their detectors). Keep them aligned with the truncated prompt
-    # list so detector lookups don't index off the end.
-    triggers = getattr(probe, "triggers", None)
-    if isinstance(triggers, (list, tuple)) and len(triggers) > prompt_cap:
-        probe.triggers = list(triggers[:prompt_cap])
+    # Keep per-prompt metadata aligned with the same prefix of the prompt list.
+    for attribute in (
+        "prompts",
+        "triggers",
+        "pi_prompts",
+        "_prompt_intents",
+        "prompt_intents",
+    ):
+        values = getattr(probe, attribute, None)
+        if isinstance(values, (list, tuple)):
+            setattr(probe, attribute, list(values[:prompt_cap]))
 
     return probe
 
 
-def _attempt_succeeded(outputs: list[str]) -> bool:
-    """Mark the attack as succeeded if no output looks like a refusal.
+def _attempt_succeeded(outputs: list[str | None]) -> bool | None:
+    """Return the worst assessable outcome, or ``None`` when none exists.
 
     Garak ships detectors per-probe but they need their own model/config
     bootstrap; for the Weave demo we just check the captured outputs
-    against the in-tree refusal patterns. Same heuristic the built-in
-    ``AttackTemplate.evaluate`` uses, so PyRIT, Garak, and the in-tree
-    catalog agree on what 'succeeded' means.
+    against the in-tree refusal patterns. This is the same refusal heuristic
+    the built-in ``AttackTemplate.evaluate`` uses.
     """
-    if not outputs:
-        return False
-    for text in outputs:
-        text = (text or "").strip()
-        if not text:
-            continue
-        if any(rx.search(text) for rx in _REFUSAL_REGEXES):
-            return False
-    return any((t or "").strip() for t in outputs)
+    meaningful = [text.strip() for text in outputs if text and text.strip()]
+    if not meaningful:
+        return None
+    return any(
+        not any(rx.search(text) for rx in _REFUSAL_REGEXES) for text in meaningful
+    )
 
 
 def _garak_attack_display_name(call: Any) -> str:
@@ -297,16 +301,21 @@ async def _run_one_probe(
 ) -> AttackResult:
     """Execute one Garak probe and convert the worst attempt to ``AttackResult``."""
     t0 = time.perf_counter()
-    generator = RAIGenerator(model)
+
+    def execute():
+        with _garak_report_sink():
+            generator = RAIGenerator(model)
+            probe = _instantiate_probe(spec.probe_path, prompt_cap=prompt_cap)
+            return list(probe.probe(generator))
 
     try:
-        probe = _instantiate_probe(spec.probe_path, prompt_cap=prompt_cap)
+        attempts = await asyncio.to_thread(execute)
     except Exception as e:
         return AttackResult(
             attack_id=spec.attack_id,
             category=spec.category,
             succeeded=False,
-            model_output=f"[garak probe init failed: {e}]",
+            model_output=f"[garak probe failed: {e}]",
             prompt=spec.objective,
             severity=spec.severity,
             latency_ms=(time.perf_counter() - t0) * 1000,
@@ -314,37 +323,41 @@ async def _run_one_probe(
             weave_call_url=_tracing.current_call_url(),
         )
 
-    try:
-        attempts = await asyncio.to_thread(probe.probe, generator)
-    except Exception as e:
-        return AttackResult(
-            attack_id=spec.attack_id,
-            category=spec.category,
-            succeeded=False,
-            model_output=f"[garak probe run failed: {e}]",
-            prompt=spec.objective,
-            severity=spec.severity,
-            latency_ms=(time.perf_counter() - t0) * 1000,
-            error=f"{spec.probe_path}: {e}",
-            weave_call_url=_tracing.current_call_url(),
-        )
-
-    outputs: list[str] = []
+    evidence: list[tuple[str, str]] = []
     for attempt in attempts or []:
+        prompt = getattr(attempt, "prompt", None)
+        turns = getattr(prompt, "turns", [])
+        prompt_text = turns[-1].content.text if turns else spec.objective
         for piece in getattr(attempt, "outputs", None) or []:
-            outputs.append(getattr(piece, "text", None) or str(piece))
+            text = piece if isinstance(piece, str) else getattr(piece, "text", None)
+            if text is not None:
+                evidence.append((str(text), prompt_text))
 
+    outputs = [text for text, _ in evidence]
     succeeded = _attempt_succeeded(outputs)
-    last_output = outputs[-1] if outputs else ""
+    meaningful_outputs = [(text, prompt) for text, prompt in evidence if text.strip()]
+    evidence_output, evidence_prompt = (
+        meaningful_outputs[-1] if meaningful_outputs else ("", spec.objective)
+    )
+    if succeeded is True:
+        evidence_output, evidence_prompt = next(
+            (text, prompt)
+            for text, prompt in reversed(meaningful_outputs)
+            if not any(rx.search(text) for rx in _REFUSAL_REGEXES)
+        )
+    outcome_error = (
+        None if succeeded is not None else "Garak probe produced no model output."
+    )
 
     return AttackResult(
         attack_id=spec.attack_id,
         category=spec.category,
-        succeeded=succeeded,
-        model_output=last_output,
-        prompt=spec.objective,
+        succeeded=bool(succeeded),
+        model_output=evidence_output,
+        prompt=evidence_prompt,
         severity=spec.severity,
         latency_ms=(time.perf_counter() - t0) * 1000,
+        error=outcome_error,
         weave_call_url=_tracing.current_call_url(),
     )
 
@@ -373,7 +386,12 @@ async def run_garak_probes(
         carry ``garak-*`` IDs.
     """
     _require_garak()
-    _ensure_garak_transient_state()
+    for name, value in (
+        ("prompt_cap", prompt_cap),
+        ("max_concurrency", max_concurrency),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{name} must be a positive integer.")
 
     if probes is None:
         probes = default_garak_probes()

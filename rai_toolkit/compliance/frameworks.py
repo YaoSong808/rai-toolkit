@@ -122,6 +122,15 @@ INDUSTRY_PRESETS: dict[str, list[str]] = {
         "MIT-5.2",   # Loss of human agency
         "MIT-7.2",   # Transparency: public accountability
     ],
+    "hr": [
+        "MIT-1.1",   # Discrimination: fair hiring and employment decisions
+        "MIT-1.3",   # Unequal performance: across demographic groups
+        "MIT-2.1",   # Privacy: candidate and employee data
+        "MIT-3.1",   # False info: candidate or policy accuracy
+        "MIT-5.1",   # Overreliance: human employment decisions
+        "MIT-5.2",   # Human agency: candidate and employee autonomy
+        "MIT-7.2",   # Transparency: explainable employment decisions
+    ],
     "general": [
         "MIT-1.1",   # Discrimination/bias
         "MIT-1.2",   # Toxic content

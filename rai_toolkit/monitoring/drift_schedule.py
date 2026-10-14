@@ -36,7 +36,7 @@ def recommended_reassessment_interval_days(preset: str) -> int:
     These are **policy suggestions**, not legal advice.
     """
     p = (preset or "").lower()
-    if p in ("healthcare", "financial_services", "government"):
+    if p in ("healthcare", "financial_services", "government", "hr"):
         return 30
     if p in ("legal", "fintech"):
         return 30

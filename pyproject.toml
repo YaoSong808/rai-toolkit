@@ -8,12 +8,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "rai-toolkit"
-version = "0.2.0"
+dynamic = ["version"]
 description = "Production-grade Responsible AI toolkit with compliance mapping, evaluation, and guardrails"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [
     { name = "Karan Nisar" },
 ]
@@ -24,9 +24,10 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
     # openai>=2.2.0 is required by the `pyrit` and `garak` extras (both depend
@@ -61,12 +62,15 @@ pyrit = [
     "pyrit>=0.13.0",
 ]
 garak = [
-    "garak>=0.15.0",
+    "garak>=0.17.0,<0.18",
     # transformers v5 (a garak transitive dep) lazy-references torchvision in
     # its `*_image_processing_fast` modules. None of our
     # runtime paths use torchvision; it's purely there to satisfy the lazy
     # attribute walk.
     "torchvision>=0.20.0",
+]
+anthropic = [
+    "anthropic>=0.40.0",
 ]
 demo = [
     "streamlit>=1.57.0",
@@ -74,7 +78,7 @@ demo = [
     "pandas>=2.1.0",
 ]
 datasets = [
-    # Upper bound matches the cap from garak 0.15 (datasets<4.0) so the [all]
+    # Upper bound matches the cap from garak 0.17 (datasets<4.0) so the [all]
     # extra still resolves. Bump in lockstep when garak relaxes its pin.
     "datasets>=3.0.0,<4.0",
 ]
@@ -83,13 +87,16 @@ dev = [
     "pytest-asyncio>=0.24.0",
 ]
 all = [
-    "rai-toolkit[weave,scorers,nemo,demo,dev,datasets,pyrit,garak]",
+    "rai-toolkit[weave,scorers,nemo,demo,dev,datasets,pyrit,garak,anthropic]",
 ]
 
 [project.urls]
 Homepage = "https://github.com/wandb/rai-toolkit"
 Repository = "https://github.com/wandb/rai-toolkit"
 Issues = "https://github.com/wandb/rai-toolkit/issues"
+
+[tool.hatch.version]
+path = "rai_toolkit/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["rai_toolkit", "integrations"]
