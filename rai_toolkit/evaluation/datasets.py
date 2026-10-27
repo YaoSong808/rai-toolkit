@@ -38,6 +38,11 @@ class DatasetLoader:
     def from_file(path: str | Path) -> list[dict[str, Any]]:
         """Load a dataset from a file.
 
+        CSV files require each data record to have no more fields than the
+        header. Records with surplus fields raise ``ValueError`` with the
+        filename and one-based data-record number after the header, not a
+        physical line number.
+
         JSON files accept an array of objects or an object with a ``data``
         array. Invalid dataset shapes raise ``ValueError`` with the filename;
         invalid rows also include their one-based array position, not a line number.
@@ -76,9 +81,15 @@ class DatasetLoader:
 
     @staticmethod
     def _load_csv(path: Path) -> list[dict[str, Any]]:
+        rows = []
         with open(path, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
-            rows = [DatasetLoader._normalize_keys(row) for row in reader]
+            for record_number, row in enumerate(reader, start=1):
+                if None in row:
+                    raise ValueError(
+                        f"{path}: record {record_number}: CSV record has more fields than header"
+                    )
+                rows.append(DatasetLoader._normalize_keys(row))
         logger.info("Loaded %d rows from %s", len(rows), path)
         return rows
 

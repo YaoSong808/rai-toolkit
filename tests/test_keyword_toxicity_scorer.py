@@ -106,6 +106,341 @@ def test_a_trimmed_stem_on_its_own_is_not_a_hit(scorer: KeywordToxicityScorer) -
     assert result.passed
 
 
+_DEFAULT_KEYWORD_COUNT = 21
+"""Keywords configured in the default categories, which is the score denominator."""
+
+_SINGLE_HIT_SCORE = 0.5238095238095238
+"""Score of exactly one canonical hit under the default configuration.
+
+Pinned as a literal because this change must not touch the scoring formula: a base
+word and every form that maps to it have to keep returning the same score.
+"""
+
+_DERIVATIVE_FORMS = (
+    ("killer", "kill", "violence"),
+    ("killers", "kill", "violence"),
+    ("murderer", "murder", "violence"),
+    ("murderers", "murder", "violence"),
+    ("shooter", "shoot", "violence"),
+    ("bomber", "bomb", "violence"),
+    ("attacker", "attack", "violence"),
+    ("hateful", "hate", "hate_speech"),
+    ("stupidity", "stupid", "harassment"),
+    ("idiotic", "idiot", "harassment"),
+    ("moronic", "moron", "harassment"),
+    ("worthlessness", "worthless", "harassment"),
+    ("inferiority", "inferior", "hate_speech"),
+    ("verminous", "vermin", "hate_speech"),
+    ("assaultive", "assault", "violence"),
+)
+"""Each derivative, the canonical keyword it must report, and that keyword's category."""
+
+
+def _spelling(text: str, case: str) -> str:
+    """Return ``text`` in ``"lower"``, ``"upper"``, or ``"mixed"`` case.
+
+    Mixed case alternates and starts with an uppercase letter, so ``"kill"``
+    becomes ``"KiLl"``.
+    """
+    if case == "lower":
+        return text.lower()
+    if case == "upper":
+        return text.upper()
+    if case == "mixed":
+        return "".join(
+            character.upper() if index % 2 == 0 else character.lower()
+            for index, character in enumerate(text)
+        )
+    raise ValueError(f"unknown case {case!r}")
+
+
+@pytest.mark.parametrize(
+    ("form", "canonical", "category"),
+    _DERIVATIVE_FORMS,
+)
+def test_keyword_derivatives_are_detected_as_their_canonical_keyword(
+    scorer: KeywordToxicityScorer, form: str, canonical: str, category: str
+) -> None:
+    """Regression: each of these forms was reported as `score=1.0`, `passed=True`
+    and `assessed=True` with no keyword match."""
+    result = scorer.score(form)
+
+    assert result.details["toxic_categories"] == {category: [canonical]}
+    assert result.details["total_matches"] == 1
+    assert result.score == _SINGLE_HIT_SCORE
+    assert not result.passed
+    assert result.assessed
+
+
+def test_a_derivative_does_not_change_the_score_denominator(
+    scorer: KeywordToxicityScorer,
+) -> None:
+    """The derivative is an alternative of the canonical keyword, not a new keyword,
+    so the 21 configured keywords - and the score of one hit - are unaffected."""
+    assert sum(len(words) for words in scorer._categories.values()) == (
+        _DEFAULT_KEYWORD_COUNT
+    )
+    assert scorer.score("kill").score == _SINGLE_HIT_SCORE
+    assert scorer.score("killer").score == scorer.score("kill").score
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "They killed the process and the killers escaped.",
+        "The shooter and the shooters left.",
+        "It was an attack by an attacker.",
+    ],
+)
+def test_a_canonical_keyword_counts_once_however_many_forms_occur(
+    scorer: KeywordToxicityScorer, response: str
+) -> None:
+    """One category contributes one canonical keyword at most, so repeating a family
+    must not push the score down like several distinct keywords would."""
+    result = scorer.score(response)
+
+    assert result.details["total_matches"] == 1
+    assert result.score == _SINGLE_HIT_SCORE
+
+
+def test_derivatives_of_different_keywords_count_separately(
+    scorer: KeywordToxicityScorer,
+) -> None:
+    result = scorer.score("A killer and a murderer.")
+
+    assert result.details["toxic_categories"] == {"violence": ["kill", "murder"]}
+    assert result.details["total_matches"] == 2
+
+
+def test_a_derivative_does_not_weaken_the_benign_controls(
+    scorer: KeywordToxicityScorer,
+) -> None:
+    """The forms added here must not turn the existing benign controls into hits."""
+    for response in (
+        "She has strong skills in Python.",
+        "The system reached stability.",
+        "An offshoot of the project.",
+        "That sentence is an oxymoron.",
+        "The paper describes a bombardier beetle.",
+    ):
+        assert scorer.score(response).passed, response
+
+
+@pytest.mark.parametrize("response", ["killbed", "killring", "bombted"])
+def test_doubling_must_repeat_the_keywords_own_final_consonant(
+    scorer: KeywordToxicityScorer, response: str
+) -> None:
+    """Regression: any character in `[bdglmnprt]` used to be accepted before "-ed"
+    or "-ing", so these synthetic non-inflections counted as hits.
+
+    Kept separate from the derivative tests so a passing derivative case cannot hide
+    a suffix regression.
+    """
+    result = scorer.score(response)
+
+    assert result.details["toxic_categories"] == {}
+    assert result.details["total_matches"] == 0
+    assert result.score == 1.0
+    assert result.passed
+
+
+@pytest.mark.parametrize(
+    ("response", "canonical"),
+    [
+        ("stabbed", "stab"),
+        ("stabbing", "stab"),
+        ("bombed", "bomb"),
+        ("bombing", "bomb"),
+    ],
+)
+def test_doubled_consonant_inflections_stay_detected(
+    scorer: KeywordToxicityScorer, response: str, canonical: str
+) -> None:
+    """The other half of the suffix correction: tightening the doubled consonant must
+    not drop the forms it exists for."""
+    result = scorer.score(response)
+
+    assert result.details["toxic_categories"] == {"violence": [canonical]}
+    assert result.score == _SINGLE_HIT_SCORE
+    assert not result.passed
+
+
+_CUSTOM_KEYWORD_SINGLE_HIT_SCORE = 0.5454545454545454
+"""Score of one hit for a scorer with the 21 default keywords plus one custom keyword.
+
+The custom keyword adds exactly one entry to the denominator, which is what keeps the
+per-keyword calibration intact.
+"""
+
+_CASED_DERIVATIVE_SCORE = 0.09090909090909094
+"""Score of two hits with 22 configured keywords: ``1 - 2 / (22 * 0.1)``.
+
+A derivative of a default keyword also hits that default keyword, so configuring
+the same word again contributes a second match. ``threshold=0.5`` sits between
+this and the one-match score above, which is where a case-sensitive derivative
+lookup changed the verdict.
+"""
+
+_CASE_VERDICT_THRESHOLD = 0.5
+
+
+@pytest.mark.parametrize(
+    ("keyword", "response"),
+    [
+        ("nab", "nabbed"),
+        ("NAB", "nabbed"),
+        ("nAb", "nabbed"),
+        ("nab", "NABBED"),
+        ("NAB", "Nabbed"),
+        ("nAb", "naBBed"),
+        ("grab", "grabbing"),
+        ("GRAB", "grabbing"),
+        ("GrAb", "GrAbBing"),
+    ],
+)
+def test_a_custom_keyword_is_matched_case_insensitively_in_its_own_spelling(
+    keyword: str, response: str
+) -> None:
+    """Regression: the doubling test compared the keyword's final character against a
+    lowercase set, so an uppercase keyword never got a doubled alternative at all -
+    `re.IGNORECASE` cannot recover an alternative that was never built. A configured
+    "NAB" missed "nabbed" entirely while "nab" matched it."""
+    scorer = KeywordToxicityScorer(extra_keywords={"custom": [keyword]})
+
+    result = scorer.score(response)
+
+    assert result.details["toxic_categories"] == {"custom": [keyword]}
+    assert result.details["total_matches"] == 1
+    assert result.score == _CUSTOM_KEYWORD_SINGLE_HIT_SCORE
+    assert result.assessed
+    assert not result.passed
+
+
+def test_case_variants_of_a_custom_keyword_score_identically() -> None:
+    """The casing of the configured keyword or of the response must not move the score:
+    the evidence keeps the caller's spelling and the denominator counts one keyword."""
+    scores = {
+        keyword: KeywordToxicityScorer(extra_keywords={"custom": [keyword]})
+        .score("nabbed")
+        .score
+        for keyword in ("nab", "NAB", "nAb")
+    }
+
+    assert set(scores.values()) == {_CUSTOM_KEYWORD_SINGLE_HIT_SCORE}
+
+
+@pytest.mark.parametrize(
+    ("keyword", "response"),
+    [
+        ("snare", "snaring"),
+        ("SNARE", "snaring"),
+        ("Snare", "snaring"),
+        ("SNARE", "SNARING"),
+    ],
+)
+def test_an_e_dropping_custom_keyword_keeps_its_form_case_insensitively(
+    keyword: str, response: str
+) -> None:
+    """Pre-existing on `main`: the e-dropping branch tested `keyword.endswith("e")`, so
+    it was skipped for an uppercase keyword and "SNARE" missed "snaring" the same way."""
+    scorer = KeywordToxicityScorer(extra_keywords={"custom": [keyword]})
+
+    result = scorer.score(response)
+
+    assert result.details["toxic_categories"] == {"custom": [keyword]}
+    assert result.score == _CUSTOM_KEYWORD_SINGLE_HIT_SCORE
+    assert not result.passed
+
+
+@pytest.mark.parametrize("response", ["KILLBED", "KillRing", "BOMBTED"])
+def test_case_variants_of_a_synthetic_doubling_are_still_not_hits(
+    scorer: KeywordToxicityScorer, response: str
+) -> None:
+    """Normalizing the doubling check must not reopen the synthetic non-inflections."""
+    result = scorer.score(response)
+
+    assert result.details["toxic_categories"] == {}
+    assert result.score == 1.0
+    assert result.passed
+
+
+@pytest.mark.parametrize(("form", "canonical", "category"), _DERIVATIVE_FORMS)
+@pytest.mark.parametrize("keyword_case", ["lower", "upper", "mixed"])
+@pytest.mark.parametrize("response_case", ["lower", "upper", "mixed"])
+def test_derivative_lookup_keeps_the_same_public_result_across_casings(
+    form: str, canonical: str, category: str, keyword_case: str, response_case: str
+) -> None:
+    """Regression: ``_KEYWORD_DERIVATIVES.get(keyword)`` used the configured spelling.
+
+    The map keys are lowercase, so ``"KILL"`` and ``"KiLl"`` missed every derivative
+    that ``"kill"`` matched. At ``threshold=0.5`` that was a different score, match
+    count, and verdict. The reported keyword stays the caller's spelling.
+    """
+    keyword = _spelling(canonical, keyword_case)
+    response = _spelling(form, response_case)
+    result = KeywordToxicityScorer(
+        extra_keywords={"custom": [keyword]},
+        threshold=_CASE_VERDICT_THRESHOLD,
+    ).score(response)
+
+    assert result.details["toxic_categories"] == {
+        category: [canonical],
+        "custom": [keyword],
+    }
+    assert result.details["total_matches"] == 2
+    assert result.score == _CASED_DERIVATIVE_SCORE
+    assert result.assessed
+    assert not result.passed
+
+
+def test_review_reproduction_keyword_and_response_casings_score_identically() -> None:
+    """The public-scorer reproduction: ``kill`` / ``KILL`` / ``KiLl`` on "killer".
+
+    Lowercase, uppercase, and mixed-case keywords and responses must share one
+    score, one match count, and one verdict, while each result reports the
+    configured spelling rather than a normalized one.
+    """
+    seen: list[tuple[float, bool, int]] = []
+    for keyword_case in ("lower", "upper", "mixed"):
+        keyword = _spelling("kill", keyword_case)
+        for response_case in ("lower", "upper", "mixed"):
+            result = KeywordToxicityScorer(
+                extra_keywords={"custom": [keyword]},
+                threshold=_CASE_VERDICT_THRESHOLD,
+            ).score(_spelling("killer", response_case))
+
+            assert result.details["toxic_categories"] == {
+                "violence": ["kill"],
+                "custom": [keyword],
+            }
+            seen.append(
+                (result.score, result.passed, result.details["total_matches"])
+            )
+
+    assert seen == [(_CASED_DERIVATIVE_SCORE, False, 2)] * len(seen)
+
+
+async def test_guardrail_blocks_a_derivative_threat() -> None:
+    """The derivative mapping has to reach an explicitly configured blocking
+    guardrail, not only direct scoring."""
+    from rai_toolkit.guardrails import GuardedModel
+    from rai_toolkit.models import CallableModel
+
+    guarded = GuardedModel(
+        model=CallableModel(
+            lambda text, context="", **kwargs: "The killer was identified."
+        ),
+        output_scorers=[KeywordToxicityScorer()],
+        block_on_scorer_fail=True,
+    )
+
+    response = await guarded.predict("a harmless prompt")
+
+    assert response.metadata["blocked"] is True
+    assert response.metadata["blocked_by"] == "scorer:KeywordToxicityScorer"
+    assert response.output == guarded.blocked_response
+
+
 async def test_guardrail_blocks_an_inflected_threat() -> None:
     """An explicitly configured blocking guardrail must reject an inflected threat
     detected by its keyword scorer."""

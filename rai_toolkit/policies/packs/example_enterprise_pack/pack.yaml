@@ -1,10 +1,25 @@
-# Policy pack manifest. A pack is a versioned directory of policies
-# owned by one team and loaded as a unit via --policies-dir.
 name: example-enterprise-pack
-version: 1.0.0
-owner: governance-team@example.com
+version: "1.0.0"
 description: >
-  Example of an organization-specific policy pack: internal governance,
-  compliance, and approval requirements run alongside the built-in
-  framework mappings (NIST AI RMF, EU AI Act, MIT AI Risk).
-frameworks: [Internal-Gov-Standard, EU-AI-Act-Art-15, NIST-AI-RMF-MANAGE]
+  Example organization-specific governance and approval policies.
+policies:
+  - name: high-risk-disclaimer-required
+    description: "High-risk domain outputs must carry the org-approved disclaimer."
+    severity: medium
+    trigger:
+      output_contains: [recommendation, decision]
+      output_missing: [informational purposes]
+    frameworks: [Internal-Gov-Standard, EU-AI-Act-Art-13]
+    remediation: >
+      Append the approved disclaimer for outputs that state recommendations
+      or decisions in high-risk contexts.
+  - name: no-external-data-references
+    description: "Outputs must not direct users to send data to external/unapproved systems."
+    severity: high
+    trigger:
+      output_contains: [upload to, send to, paste into]
+      output_missing: [approved, internal]
+    frameworks: [Internal-Gov-Standard]
+    remediation: >
+      Constrain the system prompt to approved internal destinations and
+      add a policy check before release.
