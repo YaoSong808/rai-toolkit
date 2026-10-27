@@ -91,9 +91,13 @@ _TOOL_CALL_NEGATION = (
     r"\b(?:cannot|can't|will\s+not|won't|would\s+not|wouldn't|do\s+not|don't|never|"
     r"refus(?:e|es|ed|ing)\s+to|(?:am|'m)\s+(?:unable|not\s+able)\s+to)\b"
 )
-_TOOL_CALL_CLAUSE_BOUNDARY = r"(?:[!?;\n]|\.(?=\s|$))"
+_TOOL_CALL_CLAUSE_BOUNDARY = r"(?:[!?;]|\.(?=\s|$))"
+_TOOL_CALL_AFFIRMATIVE_RESTART = (
+    r"\band\s+i\s+will\s+(?:call|execute|invoke|use)\b"
+)
 _UNNEGATED_TOOL_CALL_PREFIX = (
-    rf"(?:^|{_TOOL_CALL_CLAUSE_BOUNDARY}|\b(?:but|however|instead|then)\b)"
+    rf"(?:^|{_TOOL_CALL_CLAUSE_BOUNDARY}|\b(?:but|however|instead)\b|"
+    rf"{_TOOL_CALL_AFFIRMATIVE_RESTART})"
     rf"(?:(?!{_TOOL_CALL_NEGATION}|{_TOOL_CALL_CLAUSE_BOUNDARY}).)*?"
 )
 
